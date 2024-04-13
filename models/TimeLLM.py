@@ -162,6 +162,8 @@ class Model(nn.Module):
 
         for param in self.llm_model.parameters():
             param.requires_grad = False
+        print('LLM model is loaded')
+        print('total parameters of llm:', sum(p.numel() for p in self.llm_model.parameters()))
 
         if configs.prompt_domain:
             self.description = configs.content
@@ -183,18 +185,23 @@ class Model(nn.Module):
         self.patch_nums = int((configs.seq_len - self.patch_len) / self.stride + 2)
         self.head_nf = self.d_ff * self.patch_nums
 
-        if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
+        if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast' or self.task_name == 'classification':
             self.output_projection = FlattenHead(configs.enc_in, self.head_nf, self.pred_len,
                                                  head_dropout=configs.dropout)
         else:
             raise NotImplementedError
 
         self.normalize_layers = Normalize(configs.enc_in, affine=False)
+        self.classification_layer = nn.Linear(3, 1)
+        self.sigmoid = nn.Sigmoid() 
 
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
             dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
             return dec_out[:, -self.pred_len:, :]
+        elif self.task_name == 'classification':
+            dec_out = self.classification(x_enc)
+            return dec_out
         return None
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
@@ -237,7 +244,7 @@ class Model(nn.Module):
         source_embeddings = self.mapping_layer(self.word_embeddings.permute(1, 0)).permute(1, 0)
 
         x_enc = x_enc.permute(0, 2, 1).contiguous()
-        enc_out, n_vars = self.patch_embedding(x_enc.to(torch.bfloat16))
+        enc_out, n_vars = self.patch_embedding(x_enc)
         enc_out = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
         llama_enc_out = torch.cat([prompt_embeddings, enc_out], dim=1)
         dec_out = self.llm_model(inputs_embeds=llama_enc_out).last_hidden_state
@@ -251,6 +258,64 @@ class Model(nn.Module):
         dec_out = dec_out.permute(0, 2, 1).contiguous()
 
         dec_out = self.normalize_layers(dec_out, 'denorm')
+
+        return dec_out
+
+    def classification(self, x_enc):
+
+        x_enc = self.normalize_layers(x_enc, 'norm')
+
+        B, T, N = x_enc.size()
+        x_enc = x_enc.permute(0, 2, 1).contiguous().reshape(B * N, T, 1)
+
+        min_values = torch.min(x_enc, dim=1)[0]
+        max_values = torch.max(x_enc, dim=1)[0]
+        medians = torch.median(x_enc, dim=1).values
+        lags = self.calcute_lags(x_enc)
+        trends = x_enc.diff(dim=1).sum(dim=1)
+        prompt = []
+        for b in range(B * N):
+            min_values_str = str(min_values[b].tolist()[0])
+            max_values_str = str(max_values[b].tolist()[0])
+            median_values_str = str(medians[b].tolist()[0])
+            lags_values_str = str(lags[b].tolist())
+            channel = b % N + 1 
+
+            prompt_ = (
+                f"<|start_prompt|>Dataset description: {self.description}"
+                f"Task description: classify this signal given the previous {str(self.seq_len)} steps information; "
+                "Input statistics: "
+                f"min value of channel {channel} is {min_values_str}, "
+                f"max value of channel {channel} is {max_values_str}, "
+                f"median value of channel {channel} is {median_values_str}, "
+                f"the trend of input channel {channel} is {'upward' if trends[b] > 0 else 'downward'}, "
+                f"top 5 lags of channel {channel} are : {lags_values_str}<|<end_prompt>|>"
+            )
+            prompt.append(prompt_)
+        x_enc = x_enc.reshape(B, N, T).permute(0, 2, 1).contiguous()
+
+        prompt = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=2048).input_ids
+        prompt_embeddings = self.llm_model.get_input_embeddings()(prompt.to(x_enc.device))  # (batch, prompt_token, dim)
+
+        source_embeddings = self.mapping_layer(self.word_embeddings.permute(1, 0)).permute(1, 0)
+
+        x_enc = x_enc.permute(0, 2, 1).contiguous()
+        enc_out, n_vars = self.patch_embedding(x_enc)
+        enc_out = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
+        llama_enc_out = torch.cat([prompt_embeddings, enc_out], dim=1)
+        dec_out = self.llm_model(inputs_embeds=llama_enc_out).last_hidden_state
+        dec_out = dec_out[:, :, :self.d_ff]
+
+        dec_out = torch.reshape(
+            dec_out, (-1, n_vars, dec_out.shape[-2], dec_out.shape[-1]))
+        dec_out = dec_out.permute(0, 1, 3, 2).contiguous()
+
+        dec_out = self.output_projection(dec_out[:, :, :, -self.patch_nums:])
+        dec_out = dec_out.permute(0, 2, 1).contiguous()
+
+        dec_out = self.normalize_layers(dec_out, 'denorm')
+        dec_out = self.classification_layer(dec_out)
+        dec_out = self.sigmoid(dec_out)
 
         return dec_out
 

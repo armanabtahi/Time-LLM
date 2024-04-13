@@ -2,13 +2,15 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import shutil
+import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, precision_recall_curve, auc, roc_curve
 
 from tqdm import tqdm
 
 plt.switch_backend('agg')
 
 
-def adjust_learning_rate(accelerator, optimizer, scheduler, epoch, args, printout=True):
+def adjust_learning_rate(optimizer, scheduler, epoch, args, printout=True):
     if args.lradj == 'type1':
         lr_adjust = {epoch: args.learning_rate * (0.5 ** ((epoch - 1) // 1))}
     elif args.lradj == 'type2':
@@ -29,10 +31,8 @@ def adjust_learning_rate(accelerator, optimizer, scheduler, epoch, args, printou
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         if printout:
-            if accelerator is not None:
-                accelerator.print('Updating learning rate to {}'.format(lr))
-            else:
-                print('Updating learning rate to {}'.format(lr))
+          
+            print('Updating learning rate to {}'.format(lr))
 
 
 class EarlyStopping:
@@ -134,22 +134,22 @@ def del_files(dir_path):
     shutil.rmtree(dir_path)
 
 
-def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric):
+def vali(args, model, data_loader, criterion, mae_metric):
+    print('start validation')
     total_loss = []
     total_mae_loss = []
     model.eval()
     with torch.no_grad():
-        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in tqdm(enumerate(vali_loader)):
-            batch_x = batch_x.float().to(accelerator.device)
+        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in tqdm(enumerate(data_loader)):
+            batch_x = batch_x.float()
             batch_y = batch_y.float()
 
-            batch_x_mark = batch_x_mark.float().to(accelerator.device)
-            batch_y_mark = batch_y_mark.float().to(accelerator.device)
+            batch_x_mark = batch_x_mark.float()
+            batch_y_mark = batch_y_mark.float()
 
             # decoder input
             dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float()
-            dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(
-                accelerator.device)
+            dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float()
             # encoder - decoder
             if args.use_amp:
                 with torch.cuda.amp.autocast():
@@ -163,11 +163,10 @@ def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric
                 else:
                     outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
-            outputs, batch_y = accelerator.gather_for_metrics((outputs, batch_y))
 
             f_dim = -1 if args.features == 'MS' else 0
             outputs = outputs[:, -args.pred_len:, f_dim:]
-            batch_y = batch_y[:, -args.pred_len:, f_dim:].to(accelerator.device)
+            batch_y = batch_y[:, -args.pred_len:, f_dim:]
 
             pred = outputs.detach()
             true = batch_y.detach()
@@ -185,42 +184,96 @@ def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric
     model.train()
     return total_loss, total_mae_loss
 
-
-def test(args, accelerator, model, train_loader, vali_loader, criterion):
-    x, _ = train_loader.dataset.last_insample_window()
-    y = vali_loader.dataset.timeseries
-    x = torch.tensor(x, dtype=torch.float32).to(accelerator.device)
-    x = x.unsqueeze(-1)
-
+def test(args, model, data_loader, criterion):
+    print('start testing')
+    total_loss = []
     model.eval()
+    all_true = []
+    all_pred = []
+    all_scores = []
     with torch.no_grad():
-        B, _, C = x.shape
-        dec_inp = torch.zeros((B, args.pred_len, C)).float().to(accelerator.device)
-        dec_inp = torch.cat([x[:, -args.label_len:, :], dec_inp], dim=1)
-        outputs = torch.zeros((B, args.pred_len, C)).float().to(accelerator.device)
-        id_list = np.arange(0, B, args.eval_batch_size)
-        id_list = np.append(id_list, B)
-        for i in range(len(id_list) - 1):
-            outputs[id_list[i]:id_list[i + 1], :, :] = model(
-                x[id_list[i]:id_list[i + 1]],
-                None,
-                dec_inp[id_list[i]:id_list[i + 1]],
-                None
-            )
-        accelerator.wait_for_everyone()
-        outputs = accelerator.gather_for_metrics(outputs)
-        f_dim = -1 if args.features == 'MS' else 0
-        outputs = outputs[:, -args.pred_len:, f_dim:]
-        pred = outputs
-        true = torch.from_numpy(np.array(y)).to(accelerator.device)
-        batch_y_mark = torch.ones(true.shape).to(accelerator.device)
-        true = accelerator.gather_for_metrics(true)
-        batch_y_mark = accelerator.gather_for_metrics(batch_y_mark)
+        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in tqdm(enumerate(data_loader)):
+            batch_x = batch_x.float()
+            batch_y = batch_y.float()
 
-        loss = criterion(x[:, :, 0], args.frequency_map, pred[:, :, 0], true, batch_y_mark)
+            batch_x_mark = batch_x_mark.float()
+            batch_y_mark = batch_y_mark.float()
 
-    model.train()
-    return loss
+            # decoder input
+            dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float()
+            dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float()
+            # encoder - decoder
+            if args.use_amp:
+                with torch.cuda.amp.autocast():
+                    if args.output_attention:
+                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                    else:
+                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+            else:
+                if args.output_attention:
+                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                else:
+                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
+
+                f_dim = -1 if args.features == 'MS' else 0
+                outputs = outputs[:, -args.pred_len:, f_dim:]
+                batch_y = batch_y[:, -args.pred_len:, f_dim:]
+
+                pred = outputs.detach()
+                true = batch_y.detach()
+
+                loss = criterion(pred, true)
+                total_loss.append(loss.item())
+                if args.features == 'MS':
+                    all_true.extend(true.cpu().squeeze().numpy().tolist())
+                    all_pred.extend(pred.cpu().squeeze().numpy().tolist())
+                    all_scores.extend(pred.cpu().squeeze().numpy().tolist())
+
+    mean_loss = np.average(loss)
+
+    if args.features == 'MS':
+        all_pred = [1 if i >= 0.5 else 0 for i in all_pred]
+        accuracy = accuracy_score(all_true, all_pred)
+        precision = precision_score(all_true, all_pred)
+        recall = recall_score(all_true, all_pred)
+        f1 = f1_score(all_true, all_pred)
+
+        fpr, tpr, _ = roc_curve(all_true, all_scores)
+        roc_auc = auc(fpr, tpr)
+        precisions, recalls, _ = precision_recall_curve(all_true, all_scores)
+        pr_auc = auc(recalls, precisions)
+
+        plt.figure(figsize=(12, 6))
+
+        # ROC Curve
+        plt.subplot(1, 2, 1)
+        plt.plot(fpr, tpr, label='ROC curve (area = %0.2f)' % roc_auc)
+        plt.plot([0, 1], [0, 1], 'k--')
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('Receiver Operating Characteristic')
+        plt.legend(loc="lower right")
+
+        # Precision-Recall Curve
+        plt.subplot(1, 2, 2)
+        plt.plot(recalls, precisions, label='PR curve (area = %0.2f)' % pr_auc)
+        plt.xlabel('Recall')
+        plt.ylabel('Precision')
+        plt.title('Precision-Recall Curve')
+        plt.legend(loc="lower left")
+
+        plt.tight_layout()
+        
+        plt.savefig('model_evaluation_curves.png')
+        plt.close() 
+    else:
+        accuracy = None
+        precision = None
+        recall = None
+        f1 = None
+
+    return mean_loss, accuracy, precision, recall, f1
 
 
 def load_content(args):

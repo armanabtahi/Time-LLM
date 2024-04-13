@@ -6,9 +6,8 @@ from sklearn.preprocessing import StandardScaler
 from utils.timefeatures import time_features
 from data_provider.m4 import M4Dataset, M4Meta
 import warnings
-
+import torch
 warnings.filterwarnings('ignore')
-
 
 class Dataset_ETT_hour(Dataset):
     def __init__(self, root_path, flag='train', size=None,
@@ -387,3 +386,43 @@ class Dataset_M4(Dataset):
             insample_mask[i, -len(ts):] = 1.0
         return insample, insample_mask
 
+
+class Dataset_Zepp(Dataset):
+    def __init__(self, root_path, flag='train', sample_rate=1, train_size=15000, valid_size=3000, test_size=3000):
+        # Validate the sample_rate
+
+        if flag == 'train':
+            start, end = 0, train_size
+        elif flag == 'val':
+            start, end = train_size, train_size + valid_size
+        elif flag == 'test':
+            start, end = 0, test_size  # No slicing for test, take all data
+
+        if flag in ['train', 'val']:
+            suffix = 'train'
+        else:
+            suffix = 'test'
+
+        # Load the data
+        # Apply sampling rate
+        columns_to_use = np.arange(750)[::sample_rate]  # Take every 1/sample_rate-th item
+        
+        self.data_x = pd.read_csv(f'{root_path}/x_{suffix}.csv').iloc[start:end, columns_to_use]
+        self.data_y = pd.read_csv(f'{root_path}/y_{suffix}.csv').iloc[start:end, columns_to_use]
+        self.data_z = pd.read_csv(f'{root_path}/z_{suffix}.csv').iloc[start:end, columns_to_use]
+        self.labels = pd.read_csv(f'{root_path}/label_{suffix}.csv').iloc[start:end].values.ravel()
+
+
+        # Stack the channels
+        self.features = np.stack([self.data_x.values, self.data_y.values, self.data_z.values], axis=-1)
+        self.labels = torch.from_numpy(self.labels).unsqueeze(1).unsqueeze(1)
+
+        # Initialize dummy masks
+        self.dummy_input_mask = np.zeros((self.features.shape[1], 1), dtype=np.float32)  
+        self.dummy_output_mask = np.zeros((1, 1), dtype=np.float32)
+
+    def __getitem__(self, index):
+        return self.features[index], self.labels[index], self.dummy_input_mask, self.dummy_output_mask
+
+    def __len__(self):
+        return len(self.labels)

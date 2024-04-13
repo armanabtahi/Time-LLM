@@ -1,7 +1,5 @@
 import argparse
 import torch
-from accelerate import Accelerator, DeepSpeedPlugin
-from accelerate import DistributedDataParallelKwargs
 from torch import nn, optim
 from torch.optim import lr_scheduler
 from tqdm import tqdm
@@ -17,7 +15,7 @@ import os
 os.environ['CURL_CA_BUNDLE'] = ''
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
 
-from utils.tools import del_files, EarlyStopping, adjust_learning_rate, vali, load_content
+from utils.tools import del_files, EarlyStopping, adjust_learning_rate, vali, load_content, test
 
 parser = argparse.ArgumentParser(description='Time-LLM')
 
@@ -51,6 +49,10 @@ parser.add_argument('--freq', type=str, default='h',
                          'options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days, w:weekly, m:monthly], '
                          'you can also use more detailed freq like 15min or 3h')
 parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='location of model checkpoints')
+parser.add_argument('--sample_rate', type=int, default=1, help='sampling rate')
+parser.add_argument('--train_size', type=int, default=0, help='train size')
+parser.add_argument('--valid_size', type=int, default=0, help='valid size')
+parser.add_argument('--test_size', type=int, default=0, help='test size')
 
 # forecasting task
 parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
@@ -82,7 +84,7 @@ parser.add_argument('--llm_dim', type=int, default='4096', help='LLM model dimen
 
 
 # optimization
-parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')
+parser.add_argument('--num_workers', type=int, default=4, help='data loader num workers')
 parser.add_argument('--itr', type=int, default=1, help='experiments times')
 parser.add_argument('--train_epochs', type=int, default=10, help='train epochs')
 parser.add_argument('--align_epochs', type=int, default=10, help='alignment epochs')
@@ -99,13 +101,10 @@ parser.add_argument('--llm_layers', type=int, default=6)
 parser.add_argument('--percent', type=int, default=100)
 
 args = parser.parse_args()
-ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-deepspeed_plugin = DeepSpeedPlugin(hf_ds_config='./ds_config_zero2.json')
-accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], deepspeed_plugin=deepspeed_plugin)
 
 for ii in range(args.itr):
     # setting record of experiments
-    setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_{}_{}'.format(
+    setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_smp{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_{}_{}'.format(
         args.task_name,
         args.model_id,
         args.model,
@@ -114,6 +113,7 @@ for ii in range(args.itr):
         args.seq_len,
         args.label_len,
         args.pred_len,
+        args.sample_rate,
         args.d_model,
         args.n_heads,
         args.e_layers,
@@ -123,9 +123,11 @@ for ii in range(args.itr):
         args.embed,
         args.des, ii)
 
-    train_data, train_loader = data_provider(args, 'train')
-    vali_data, vali_loader = data_provider(args, 'val')
-    test_data, test_loader = data_provider(args, 'test')
+    args.content = load_content(args)
+
+    train_loader = data_provider(args, 'train')
+    vali_loader = data_provider(args, 'val')
+    test_loader = data_provider(args, 'test')
 
     if args.model == 'Autoformer':
         model = Autoformer.Model(args).float()
@@ -136,19 +138,19 @@ for ii in range(args.itr):
 
     path = os.path.join(args.checkpoints,
                         setting + '-' + args.model_comment)  # unique checkpoint saving path
-    args.content = load_content(args)
-    if not os.path.exists(path) and accelerator.is_local_main_process:
+    if not os.path.exists(path) :
         os.makedirs(path)
 
     time_now = time.time()
 
     train_steps = len(train_loader)
-    early_stopping = EarlyStopping(accelerator=accelerator, patience=args.patience)
 
     trained_parameters = []
     for p in model.parameters():
         if p.requires_grad is True:
             trained_parameters.append(p)
+    print('total params:', sum(p.numel() for p in model.parameters()))
+    print('trainable params:', sum(p.numel() for p in trained_parameters))
 
     model_optim = optim.Adam(trained_parameters, lr=args.learning_rate)
 
@@ -161,11 +163,13 @@ for ii in range(args.itr):
                                             epochs=args.train_epochs,
                                             max_lr=args.learning_rate)
 
-    criterion = nn.MSELoss()
+    if args.features == 'MS':
+        criterion = nn.BCELoss()
+    else:
+        criterion = nn.MSELoss()
+    
     mae_metric = nn.L1Loss()
 
-    train_loader, vali_loader, test_loader, model, model_optim, scheduler = accelerator.prepare(
-        train_loader, vali_loader, test_loader, model, model_optim, scheduler)
 
     if args.use_amp:
         scaler = torch.cuda.amp.GradScaler()
@@ -180,16 +184,14 @@ for ii in range(args.itr):
             iter_count += 1
             model_optim.zero_grad()
 
-            batch_x = batch_x.float().to(accelerator.device)
-            batch_y = batch_y.float().to(accelerator.device)
-            batch_x_mark = batch_x_mark.float().to(accelerator.device)
-            batch_y_mark = batch_y_mark.float().to(accelerator.device)
+            batch_x = batch_x.float()
+            batch_y = batch_y.float()
+            batch_x_mark = batch_x_mark.float()
+            batch_y_mark = batch_y_mark.float()
 
             # decoder input
-            dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float().to(
-                accelerator.device)
-            dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(
-                accelerator.device)
+            dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float()
+            dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float()
 
             # encoder - decoder
             if args.use_amp:
@@ -201,7 +203,7 @@ for ii in range(args.itr):
 
                     f_dim = -1 if args.features == 'MS' else 0
                     outputs = outputs[:, -args.pred_len:, f_dim:]
-                    batch_y = batch_y[:, -args.pred_len:, f_dim:].to(accelerator.device)
+                    batch_y = batch_y[:, -args.pred_len:, f_dim:]
                     loss = criterion(outputs, batch_y)
                     train_loss.append(loss.item())
             else:
@@ -217,11 +219,11 @@ for ii in range(args.itr):
                 train_loss.append(loss.item())
 
             if (i + 1) % 100 == 0:
-                accelerator.print(
+                print(
                     "\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
                 speed = (time.time() - time_now) / iter_count
                 left_time = speed * ((args.train_epochs - epoch) * train_steps - i)
-                accelerator.print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
+                print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
                 iter_count = 0
                 time_now = time.time()
 
@@ -230,41 +232,38 @@ for ii in range(args.itr):
                 scaler.step(model_optim)
                 scaler.update()
             else:
-                accelerator.backward(loss)
+                loss.backward()
                 model_optim.step()
 
-            if args.lradj == 'TST':
-                adjust_learning_rate(accelerator, model_optim, scheduler, epoch + 1, args, printout=False)
-                scheduler.step()
 
-        accelerator.print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
+
+        print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
         train_loss = np.average(train_loss)
-        vali_loss, vali_mae_loss = vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric)
-        test_loss, test_mae_loss = vali(args, accelerator, model, test_data, test_loader, criterion, mae_metric)
-        accelerator.print(
-            "Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f} Test Loss: {3:.7f} MAE Loss: {4:.7f}".format(
-                epoch + 1, train_loss, vali_loss, test_loss, test_mae_loss))
+        vali_loss, vali_mae_loss = vali(args, model, vali_loader, criterion, mae_metric)
+        
+        print(
+            "Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f}".format(
+                epoch + 1, train_loss, vali_loss))
 
-        early_stopping(vali_loss, model, path)
-        if early_stopping.early_stop:
-            accelerator.print("Early stopping")
-            break
 
         if args.lradj != 'TST':
             if args.lradj == 'COS':
                 scheduler.step()
-                accelerator.print("lr = {:.10f}".format(model_optim.param_groups[0]['lr']))
+                print("lr = {:.10f}".format(model_optim.param_groups[0]['lr']))
             else:
                 if epoch == 0:
                     args.learning_rate = model_optim.param_groups[0]['lr']
-                    accelerator.print("lr = {:.10f}".format(model_optim.param_groups[0]['lr']))
-                adjust_learning_rate(accelerator, model_optim, scheduler, epoch + 1, args, printout=True)
+                    print("lr = {:.10f}".format(model_optim.param_groups[0]['lr']))
+                adjust_learning_rate( model_optim, scheduler, epoch + 1, args, printout=True)
 
         else:
-            accelerator.print('Updating learning rate to {}'.format(scheduler.get_last_lr()[0]))
+            print('Updating learning rate to {}'.format(scheduler.get_last_lr()[0]))
 
-accelerator.wait_for_everyone()
-if accelerator.is_local_main_process:
-    path = './checkpoints'  # unique checkpoint saving path
-    del_files(path)  # delete checkpoint files
-    accelerator.print('success delete checkpoints')
+
+test_loss, accuracy_score, precision_score, recall_score, f1_score = test(args, model, test_loader, criterion)
+print("Test Loss: {0:.7f} Accuracy: {1:.7f} Precision: {2:.7f} Recall: {3:.7f} F1: {4:.7f}".format(
+    test_loss, accuracy_score, precision_score, recall_score, f1_score))
+
+path = './checkpoints'  # unique checkpoint saving path
+del_files(path)  # delete checkpoint files
+print('success delete checkpoints')

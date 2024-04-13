@@ -1,0 +1,1 @@
+For this binary classification task, we have time series data from the accelerometer in 3 axes and a binary label of 0 or 1. The accelerometer data is sampled at 25Hz, and each row of data shows data over non-overlapping 30s window in three channels of 1, 2 and 3.

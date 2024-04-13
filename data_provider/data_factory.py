@@ -1,4 +1,4 @@
-from data_provider.data_loader import Dataset_ETT_hour, Dataset_ETT_minute, Dataset_Custom, Dataset_M4
+from data_provider.data_loader import Dataset_ETT_hour, Dataset_ETT_minute, Dataset_Custom, Dataset_M4, Dataset_Zepp
 from torch.utils.data import DataLoader
 
 data_dict = {
@@ -10,6 +10,7 @@ data_dict = {
     'Traffic': Dataset_Custom,
     'Weather': Dataset_Custom,
     'm4': Dataset_M4,
+    'Zepp': Dataset_Zepp
 }
 
 
@@ -42,6 +43,15 @@ def data_provider(args, flag):
             freq=freq,
             seasonal_patterns=args.seasonal_patterns
         )
+    elif args.data == 'Zepp':
+        data_set = Data(
+            root_path=args.root_path,
+            flag=flag,
+            sample_rate=args.sample_rate,
+            train_size=args.train_size,
+            valid_size=args.valid_size,
+            test_size=args.test_size,
+        )
     else:
         data_set = Data(
             root_path=args.root_path,
@@ -59,6 +69,5 @@ def data_provider(args, flag):
         data_set,
         batch_size=batch_size,
         shuffle=shuffle_flag,
-        num_workers=args.num_workers,
         drop_last=drop_last)
-    return data_set, data_loader
+    return data_loader
